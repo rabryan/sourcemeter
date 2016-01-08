@@ -9,23 +9,27 @@ import time
 import logging as log
 
 from drift.model.core import Source, Attr, register_source_class
-from drift.model.projects.project import ProjectScript, register_project_script
+from drift.model.projects.project import Project, register_project_class
 
 def parse_reading(readstr):
     """
     output readings look like
     \x13+2.949037E+00\x11\r
 
-    just take the digits at index 2-6 as value
-
-    ###assumes values in range [1-10)
     """
-    if not re.match("\x13\+[0-9]+.*", readstr):
+    log.debug("reading: {}".format(readstr))
+    if not re.match("\x13[+-][0-9]+.*", readstr):
         return None
 
-    return float(readstr[2:8])
+    try:
+        value = float(readstr[1:-2])
+    except Exception as e:
+        log.error("Unable to parse reading \'{}\'".format(readstr))
+        value = None
 
+    return value
 
+@register_source_class( "Keithley" )
 class Keithley( Source ):
     sampleint = Attr("Sample Interval (s)", float, default=1, min=0.2, max=100000)
     port = Attr("Serial Port", str, readonly=True, default="/dev/ttyUSB0")
@@ -36,8 +40,32 @@ class Keithley( Source ):
         self.newDatum("Voltage", units="v")
         self._last_read = 0
     
+    def __getstate__(self):
+        state = super().__getstate__()
+        return state
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        self.com = None
+        try:
+            self.com = serial.Serial(self.port, 9600, timeout=1)
+        except Exception as e:
+            log.warn("Unable to reconnect to keithley")
+            log.info(str(e))
+        self._last_read = 0
+
     def start(self):
         """ reset and set to measure voltage """
+        if not hasattr(self, "com"):
+            try:
+                self.com = serial.Serial(self.port, 9600, timeout=1)
+            except Exception as e:
+                self.com = None
+                log.warn("Unable to connect to keithley")
+                log.info(str(e))
+        
+        if not self.com: return
+
         self.com.write("*rst\n".encode())
         self.com.write("source:func curr\n".encode())
         self.com.write("sense:func 'voltage'\n'".encode())
@@ -47,14 +75,22 @@ class Keithley( Source ):
         self.read()
 
     def tic(self):
+        if not hasattr(self, "_last_read"): self._last_read = 0
+
         if time.time() - self._last_read >= self.sampleint:
-            self.read()
             self._last_read = time.time()
+            self.read()
 
     def read(self):
-        self.com.write("read?\n".encode())
+        if not self.com: return
+        try:
+            self.com.write("read?\n".encode())
+            output = self.com.readall()
+        except Exception as e:
+            log.error("Exception during keithley read")
+            log.error(str(e))
+            return
 
-        output = self.com.readall()
         value = parse_reading(output.decode())
         if value:
             self.broadcast( "Voltage", time.time(), value )
@@ -63,21 +99,19 @@ class Keithley( Source ):
             log.warning("Invalid sourcemeter response \'{}\'".format( output.decode()))
 
 
-
-@register_project_script("Keithley")
-class KeithleyScript(ProjectScript):
-    def __init__( self, project):
+@register_project_class("Keithley")
+class KeithleyScript(Project):
+    def __init__( self ):
         super().__init__()
         self.sourcemeter = Keithley() 
-        self.connectJobTimer(project)
-        project.add(self.sourcemeter)
+        self.add(self.sourcemeter)
 
-    def start(self):
-        self.sourcemeter.start()
+#    def start(self):
+#        self.sourcemeter.start()
     
-    def stop(self):
-        self.sourcemeter.stop()
-        self.removeJobs()
+#    def stop(self):
+#        self.sourcemeter.stop()
+#        self.removeJobs()
 
 if __name__ == "__main__":
     print(time.ctime())
